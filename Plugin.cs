@@ -7,7 +7,7 @@ using UnityEngine;
 
 namespace HookTest
 {
-    [BepInPlugin("user.alphaomegacrest", "AlphaOmegaCrestMaker", "1.0.2")]
+    [BepInPlugin("user.alphaomegacrest", "AlphaOmegaCrestMaker", "1.0.3")]
     public class HookTestPlugin : BaseUnityPlugin
     {
         internal static BepInEx.Logging.ManualLogSource Log;
@@ -15,7 +15,7 @@ namespace HookTest
         private void Awake()
         {
             Log = Logger;
-            Logger.LogInfo("AOCrest v3: Awake");
+            Logger.LogInfo("AOCrest v4: Awake");
             try { gameObject.AddComponent<CrestMaker>(); }
             catch (Exception e) { Logger.LogError("AOCrest: AddComponent maker failed: " + e); }
             try { gameObject.AddComponent<CrestDiag>(); }
@@ -121,14 +121,11 @@ namespace HookTest
             {
                 FieldInfo f = FindField(newCfg.GetType(), fn);
                 if (f == null) { Log("config field missing: " + fn); continue; }
-                object before = f.GetValue(newCfg);
-                object wand = f.GetValue(wandCfg);
-                f.SetValue(newCfg, wand);
-                Log("config " + fn + ": Witch=" + before + " Wanderer=" + wand + " -> now " + f.GetValue(newCfg));
+                f.SetValue(newCfg, f.GetValue(wandCfg));
             }
             SetF(clone, "heroConfig", newCfg);
 
-            BuildSlots(clone, witch, wanderer);
+            int slotCount = BuildSlots(clone, witch, wanderer);
 
             try
             {
@@ -148,11 +145,58 @@ namespace HookTest
                     unlock.Invoke(clone, null);
                     Log("Unlock called");
                 }
-                else Log("Unlock not callable without arguments");
             }
             catch (Exception e) { Log("Unlock failed: " + e.Message); }
 
+            try { SyncSave(clone, slotCount); }
+            catch (Exception e) { Log("SyncSave failed: " + e); }
+
             Log("DONE - crest " + CrestName + " created");
+        }
+
+        private static void SyncSave(UnityEngine.Object crest, int n)
+        {
+            PropertyInfo p = crest.GetType().GetProperty("SaveData", All);
+            if (p == null) { Log("SaveData property missing"); return; }
+            object sd = p.GetValue(crest, null);
+            if (sd == null) { Log("SaveData is null"); return; }
+            FieldInfo sf = FindField(sd.GetType(), "Slots");
+            if (sf == null) { Log("SaveData.Slots missing"); return; }
+            object cur = sf.GetValue(sd);
+            IList curList = cur as IList;
+            if (curList == null) { Log("SaveData.Slots is not a list"); return; }
+            int before = curList.Count;
+            if (before == n) { Log("SaveData slots already " + n); return; }
+
+            Type elem = cur is Array ? cur.GetType().GetElementType() : cur.GetType().GetGenericArguments()[0];
+            List<object> items = new List<object>();
+            for (int i = 0; i < n; i++)
+            {
+                object it = i < before ? curList[i] : Activator.CreateInstance(elem);
+                if (i >= before)
+                {
+                    FieldInfo iu = FindField(elem, "IsUnlocked");
+                    if (iu != null) iu.SetValue(it, true);
+                }
+                items.Add(it);
+            }
+
+            object fresh;
+            if (cur is Array)
+            {
+                Array arr = Array.CreateInstance(elem, n);
+                for (int i = 0; i < n; i++) arr.SetValue(items[i], i);
+                fresh = arr;
+            }
+            else
+            {
+                IList lst = (IList)Activator.CreateInstance(cur.GetType());
+                foreach (object it in items) lst.Add(it);
+                fresh = lst;
+            }
+            sf.SetValue(sd, fresh);
+            p.SetValue(crest, sd, null);
+            Log("SaveData slots fixed: " + before + " -> " + n);
         }
 
         private static object Pick(List<object> protos, string type, string bind)
@@ -167,7 +211,7 @@ namespace HookTest
             return typeOnly;
         }
 
-        private void BuildSlots(UnityEngine.Object clone, UnityEngine.Object witch, UnityEngine.Object wanderer)
+        private int BuildSlots(UnityEngine.Object clone, UnityEngine.Object witch, UnityEngine.Object wanderer)
         {
             Array wSlots = (Array)GetF(witch, "slots");
             Array pSlots = (Array)GetF(wanderer, "slots");
@@ -196,7 +240,7 @@ namespace HookTest
             for (int i = 0; i < n; i++)
             {
                 object proto = Pick(protos, types[i], binds[i]);
-                if (proto == null) { Log("no slot prototype for " + types[i]); return; }
+                if (proto == null) { Log("no slot prototype for " + types[i]); return 0; }
                 object s = Activator.CreateInstance(et);
                 foreach (FieldInfo f in et.GetFields(All))
                     if (!f.IsStatic) f.SetValue(s, f.GetValue(proto));
@@ -224,6 +268,7 @@ namespace HookTest
             }
             SetF(clone, "slots", ns);
             Log("slots built: " + n);
+            return n;
         }
 
         private void Register(UnityEngine.Object clone)
@@ -231,7 +276,6 @@ namespace HookTest
             Type listType = FindType("ToolCrestList");
             if (listType == null) { Log("ToolCrestList type not found"); return; }
             UnityEngine.Object[] lists = Resources.FindObjectsOfTypeAll(listType);
-            Log("ToolCrestList assets: " + lists.Length);
             foreach (UnityEngine.Object list in lists)
             {
                 bool added = false;
@@ -242,6 +286,8 @@ namespace HookTest
                     {
                         if (f.IsStatic) continue;
                         object v = f.GetValue(list);
+                        IList il = v as IList;
+                        if (il == null) continue;
                         if (v is Array)
                         {
                             Array old = (Array)v;
@@ -251,18 +297,11 @@ namespace HookTest
                             Array.Copy(old, bigger, old.Length);
                             bigger.SetValue(clone, old.Length);
                             f.SetValue(list, bigger);
-                            added = true;
-                            Log("added to array field " + f.Name);
-                            break;
                         }
-                        IList il = v as IList;
-                        if (il != null)
-                        {
-                            il.Add(clone);
-                            added = true;
-                            Log("added to list field " + f.Name);
-                            break;
-                        }
+                        else il.Add(clone);
+                        added = true;
+                        Log("added to " + f.Name);
+                        break;
                     }
                     t = t.BaseType;
                 }
@@ -274,7 +313,7 @@ namespace HookTest
     public class CrestDiag : MonoBehaviour
     {
         private const BindingFlags All = CrestMaker.All;
-        private string lastCrest = "", lastCfg = "", lastAttack = "";
+        private string lastState = "";
 
         private static void L(string s) { HookTestPlugin.Log.LogInfo("AODiag: " + s); }
 
@@ -297,6 +336,25 @@ namespace HookTest
             return t.Name;
         }
 
+        private static string CurrentCrestId()
+        {
+            Type pd = CrestMaker.FindType("PlayerData");
+            if (pd == null) return "PlayerData type missing";
+            object inst = null;
+            foreach (FieldInfo f in pd.GetFields(All))
+                if (f.IsStatic && f.FieldType == pd) { inst = f.GetValue(null); break; }
+            if (inst == null)
+                foreach (PropertyInfo p in pd.GetProperties(All))
+                {
+                    if (p.PropertyType != pd || p.GetIndexParameters().Length != 0) continue;
+                    MethodInfo g = p.GetGetMethod(true);
+                    if (g != null && g.IsStatic) { inst = g.Invoke(null, null); break; }
+                }
+            if (inst == null) return "PlayerData instance not found";
+            FieldInfo cf = CrestMaker.FindField(pd, "CurrentCrestID");
+            return cf == null ? "CurrentCrestID missing" : Desc(cf.GetValue(inst));
+        }
+
         private IEnumerator Run()
         {
             Type crestType = CrestMaker.FindType("ToolCrest");
@@ -307,114 +365,71 @@ namespace HookTest
             for (int i = 0; i < 300; i++)
             {
                 yield return new WaitForSeconds(3f);
-                try { ours = FindByName(crestType, "AlphaOmega"); } catch (Exception) { }
+                try
+                {
+                    ours = FindByName(crestType, "AlphaOmega");
+                    if (ours != null && UnityEngine.Object.FindObjectOfType(hcType) == null) ours = null;
+                }
+                catch (Exception) { ours = null; }
                 if (ours != null) break;
             }
-            if (ours == null) { L("our crest was never found"); yield break; }
+            if (ours == null) { L("our crest or hero never found"); yield break; }
 
-            try { CompareConfigs(crestType, ours); }
-            catch (Exception e) { L("compare failed: " + e); }
-            try { DumpSave(crestType, ours); }
-            catch (Exception e) { L("save dump failed: " + e); }
+            try { LogSave(crestType, ours); }
+            catch (Exception e) { L("save log failed: " + e.Message); }
+
+            yield return new WaitForSeconds(20f);
+            try { AutoEquip(); }
+            catch (Exception e) { L("auto equip failed: " + e); }
 
             for (int i = 0; i < 400; i++)
             {
                 yield return new WaitForSeconds(3f);
-                try { Track(crestType, hcType); }
+                try { Track(hcType); }
                 catch (Exception e) { L("track failed: " + e.Message); yield break; }
             }
         }
 
-        private void CompareConfigs(Type crestType, UnityEngine.Object ours)
+        private void LogSave(Type crestType, UnityEngine.Object ours)
         {
-            UnityEngine.Object witch = FindByName(crestType, "Witch");
-            UnityEngine.Object wand = FindByName(crestType, "Wanderer");
-            object cw = CrestMaker.GetF(witch, "heroConfig");
-            object cd = CrestMaker.GetF(wand, "heroConfig");
-            object co = CrestMaker.GetF(ours, "heroConfig");
-            L("config types: " + cw.GetType().Name);
-            foreach (FieldInfo f in cw.GetType().GetFields(All))
-            {
-                if (f.IsStatic) continue;
-                string a = Desc(f.GetValue(cw));
-                string b = Desc(f.GetValue(cd));
-                string c = Desc(f.GetValue(co));
-                if (a != b) L("DIFF " + f.Name + ": witch=" + a + " wanderer=" + b + " ours=" + c);
-            }
-            L("config compare done");
-        }
-
-        private void DumpSave(Type crestType, UnityEngine.Object ours)
-        {
+            Array slots = (Array)CrestMaker.GetF(ours, "slots");
             PropertyInfo p = crestType.GetProperty("SaveData", All);
-            if (p == null) { L("SaveData property not found"); return; }
-            object sd = p.GetValue(ours, null);
-            L("SaveData of our crest: " + (sd == null ? "null" : sd.GetType().Name));
-            if (sd != null) DumpObject(sd, "save. ", 0);
-            PropertyInfo iu = crestType.GetProperty("IsUnlocked", All);
-            if (iu != null) L("IsUnlocked = " + iu.GetValue(ours, null));
+            object sd = p == null ? null : p.GetValue(ours, null);
+            IList sl = sd == null ? null : CrestMaker.GetF(sd, "Slots") as IList;
+            L("crest slots=" + slots.Length + " saveSlots=" + (sl == null ? -1 : sl.Count));
         }
 
-        private void DumpObject(object o, string prefix, int depth)
-        {
-            if (o == null) return;
-            foreach (FieldInfo f in o.GetType().GetFields(All))
-            {
-                if (f.IsStatic) continue;
-                object v;
-                try { v = f.GetValue(o); } catch (Exception) { continue; }
-                string name = prefix + f.Name;
-                if (v == null) { L(name + " = null"); continue; }
-                Type t = v.GetType();
-                if (t.IsPrimitive || t.IsEnum || v is string) L(name + " = " + v);
-                else if (v is UnityEngine.Object) L(name + " -> " + Desc(v));
-                else if (v is IEnumerable)
-                {
-                    int count = 0;
-                    foreach (object item in (IEnumerable)v)
-                    {
-                        if (count < 10 && depth < 2) DumpObject(item, name + "[" + count + "]. ", depth + 1);
-                        count++;
-                    }
-                    L(name + " count = " + count);
-                }
-                else if (depth < 2) DumpObject(v, name + ". ", depth + 1);
-            }
-        }
-
-        private void Track(Type crestType, Type hcType)
+        private void AutoEquip()
         {
             Type tim = CrestMaker.FindType("ToolItemManager");
-            if (tim != null)
+            if (tim == null) { L("ToolItemManager missing"); return; }
+            MethodInfo m = tim.GetMethod("SetEquippedCrest", All);
+            if (m == null) { L("SetEquippedCrest missing"); return; }
+            object target = null;
+            if (!m.IsStatic)
             {
-                foreach (MethodInfo m in tim.GetMethods(All))
-                {
-                    if (!m.IsStatic || m.GetParameters().Length != 0 || m.ReturnType != crestType) continue;
-                    object r = m.Invoke(null, null);
-                    string name = Desc(r);
-                    if (name != lastCrest)
-                    {
-                        lastCrest = name;
-                        L("current crest via " + m.Name + " = " + name);
-                    }
-                    break;
-                }
+                target = UnityEngine.Object.FindObjectOfType(tim);
+                if (target == null) { L("no ToolItemManager instance"); return; }
             }
+            L("before equip: " + CurrentCrestId());
+            m.Invoke(target, new object[] { "AlphaOmega" });
+            L("SetEquippedCrest called");
+            L("after equip: " + CurrentCrestId());
+        }
 
+        private void Track(Type hcType)
+        {
             object hc = UnityEngine.Object.FindObjectOfType(hcType);
             if (hc == null) return;
             string cfg = "";
-            string attack = "";
             foreach (FieldInfo f in hcType.GetFields(All))
             {
                 if (f.IsStatic) continue;
-                if (f.FieldType.Name == "HeroControllerConfig")
-                    cfg += f.Name + "=" + Desc(f.GetValue(hc)) + " ";
-                else if (f.Name.IndexOf("attack", StringComparison.OrdinalIgnoreCase) >= 0 && f.FieldType.IsPrimitive)
-                    attack += f.Name + "=" + f.GetValue(hc) + " ";
+                if (f.FieldType.Name == "HeroControllerConfig") cfg += f.Name + "=" + Desc(f.GetValue(hc)) + " ";
+                else if (f.Name == "attackDuration") cfg += "attackDuration=" + f.GetValue(hc) + " ";
             }
-            if (cfg != lastCfg) { lastCfg = cfg; L("hero config fields: " + cfg); }
-            if (attack != lastAttack) { lastAttack = attack; L("hero attack fields: " + attack); }
+            string state = "crestId=" + CurrentCrestId() + " " + cfg;
+            if (state != lastState) { lastState = state; L("state: " + state); }
         }
     }
 }
