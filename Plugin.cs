@@ -7,7 +7,7 @@ using UnityEngine;
 
 namespace HookTest
 {
-    [BepInPlugin("user.alphaomegacrest", "AlphaOmegaCrestMaker", "1.0.0")]
+    [BepInPlugin("user.alphaomegacrest", "AlphaOmegaCrestMaker", "1.0.2")]
     public class HookTestPlugin : BaseUnityPlugin
     {
         internal static BepInEx.Logging.ManualLogSource Log;
@@ -15,15 +15,17 @@ namespace HookTest
         private void Awake()
         {
             Log = Logger;
-            Logger.LogInfo("AOCrest v1: Awake");
+            Logger.LogInfo("AOCrest v3: Awake");
             try { gameObject.AddComponent<CrestMaker>(); }
-            catch (Exception e) { Logger.LogError("AOCrest: AddComponent failed: " + e); }
+            catch (Exception e) { Logger.LogError("AOCrest: AddComponent maker failed: " + e); }
+            try { gameObject.AddComponent<CrestDiag>(); }
+            catch (Exception e) { Logger.LogError("AOCrest: AddComponent diag failed: " + e); }
         }
     }
 
     public class CrestMaker : MonoBehaviour
     {
-        private const BindingFlags All = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static;
+        internal const BindingFlags All = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static;
         private const string CrestName = "AlphaOmega";
         private static readonly string[] SpeedFields = { "attackDuration", "quickAttackSpeedMult", "attackRecoveryTime", "attackCooldownTime", "quickAttackCooldownTime", "canBind" };
 
@@ -31,7 +33,7 @@ namespace HookTest
 
         private void Awake() { StartCoroutine(Run()); }
 
-        private static Type FindType(string name)
+        internal static Type FindType(string name)
         {
             foreach (Assembly a in AppDomain.CurrentDomain.GetAssemblies())
             {
@@ -45,7 +47,7 @@ namespace HookTest
             return null;
         }
 
-        private static FieldInfo FindField(Type t, string name)
+        internal static FieldInfo FindField(Type t, string name)
         {
             while (t != null)
             {
@@ -56,13 +58,13 @@ namespace HookTest
             return null;
         }
 
-        private static object GetF(object o, string name)
+        internal static object GetF(object o, string name)
         {
             FieldInfo f = FindField(o.GetType(), name);
             return f == null ? null : f.GetValue(o);
         }
 
-        private static void SetF(object o, string name, object v)
+        internal static void SetF(object o, string name, object v)
         {
             FieldInfo f = FindField(o.GetType(), name);
             if (f != null) f.SetValue(o, v);
@@ -174,8 +176,8 @@ namespace HookTest
             foreach (object s in wSlots) protos.Add(s);
             foreach (object s in pSlots) protos.Add(s);
 
-            string[] types = { "Skill", "Red", "Yellow", "Blue", "Red", "Blue", "Yellow", "Blue" };
-            string[] binds = { "Neutral", "Up", "Down", "Down", "Down", "Down", "Down", "Down" };
+            string[] types = { "Skill", "Red", "Yellow", "Blue", "Red", "Blue", "Yellow", "Blue", "Yellow" };
+            string[] binds = { "Neutral", "Up", "Down", "Down", "Down", "Down", "Down", "Down", "Down" };
             int n = types.Length;
 
             Vector2[] pos = new Vector2[n];
@@ -239,7 +241,6 @@ namespace HookTest
                     foreach (FieldInfo f in t.GetFields(All | BindingFlags.DeclaredOnly))
                     {
                         if (f.IsStatic) continue;
-                        Log("list field " + f.FieldType.Name + " " + f.Name);
                         object v = f.GetValue(list);
                         if (v is Array)
                         {
@@ -267,6 +268,153 @@ namespace HookTest
                 }
                 if (!added) Log("could not find a list field to add the crest to");
             }
+        }
+    }
+
+    public class CrestDiag : MonoBehaviour
+    {
+        private const BindingFlags All = CrestMaker.All;
+        private string lastCrest = "", lastCfg = "", lastAttack = "";
+
+        private static void L(string s) { HookTestPlugin.Log.LogInfo("AODiag: " + s); }
+
+        private void Awake() { StartCoroutine(Run()); }
+
+        private static UnityEngine.Object FindByName(Type t, string name)
+        {
+            foreach (UnityEngine.Object o in Resources.FindObjectsOfTypeAll(t))
+                if (o.name == name) return o;
+            return null;
+        }
+
+        private static string Desc(object v)
+        {
+            if (v == null) return "null";
+            UnityEngine.Object uo = v as UnityEngine.Object;
+            if (uo != null) return v.GetType().Name + "'" + uo.name + "'";
+            Type t = v.GetType();
+            if (t.IsPrimitive || t.IsEnum || v is string) return v.ToString();
+            return t.Name;
+        }
+
+        private IEnumerator Run()
+        {
+            Type crestType = CrestMaker.FindType("ToolCrest");
+            Type hcType = CrestMaker.FindType("HeroController");
+            if (crestType == null || hcType == null) { L("types missing"); yield break; }
+
+            UnityEngine.Object ours = null;
+            for (int i = 0; i < 300; i++)
+            {
+                yield return new WaitForSeconds(3f);
+                try { ours = FindByName(crestType, "AlphaOmega"); } catch (Exception) { }
+                if (ours != null) break;
+            }
+            if (ours == null) { L("our crest was never found"); yield break; }
+
+            try { CompareConfigs(crestType, ours); }
+            catch (Exception e) { L("compare failed: " + e); }
+            try { DumpSave(crestType, ours); }
+            catch (Exception e) { L("save dump failed: " + e); }
+
+            for (int i = 0; i < 400; i++)
+            {
+                yield return new WaitForSeconds(3f);
+                try { Track(crestType, hcType); }
+                catch (Exception e) { L("track failed: " + e.Message); yield break; }
+            }
+        }
+
+        private void CompareConfigs(Type crestType, UnityEngine.Object ours)
+        {
+            UnityEngine.Object witch = FindByName(crestType, "Witch");
+            UnityEngine.Object wand = FindByName(crestType, "Wanderer");
+            object cw = CrestMaker.GetF(witch, "heroConfig");
+            object cd = CrestMaker.GetF(wand, "heroConfig");
+            object co = CrestMaker.GetF(ours, "heroConfig");
+            L("config types: " + cw.GetType().Name);
+            foreach (FieldInfo f in cw.GetType().GetFields(All))
+            {
+                if (f.IsStatic) continue;
+                string a = Desc(f.GetValue(cw));
+                string b = Desc(f.GetValue(cd));
+                string c = Desc(f.GetValue(co));
+                if (a != b) L("DIFF " + f.Name + ": witch=" + a + " wanderer=" + b + " ours=" + c);
+            }
+            L("config compare done");
+        }
+
+        private void DumpSave(Type crestType, UnityEngine.Object ours)
+        {
+            PropertyInfo p = crestType.GetProperty("SaveData", All);
+            if (p == null) { L("SaveData property not found"); return; }
+            object sd = p.GetValue(ours, null);
+            L("SaveData of our crest: " + (sd == null ? "null" : sd.GetType().Name));
+            if (sd != null) DumpObject(sd, "save. ", 0);
+            PropertyInfo iu = crestType.GetProperty("IsUnlocked", All);
+            if (iu != null) L("IsUnlocked = " + iu.GetValue(ours, null));
+        }
+
+        private void DumpObject(object o, string prefix, int depth)
+        {
+            if (o == null) return;
+            foreach (FieldInfo f in o.GetType().GetFields(All))
+            {
+                if (f.IsStatic) continue;
+                object v;
+                try { v = f.GetValue(o); } catch (Exception) { continue; }
+                string name = prefix + f.Name;
+                if (v == null) { L(name + " = null"); continue; }
+                Type t = v.GetType();
+                if (t.IsPrimitive || t.IsEnum || v is string) L(name + " = " + v);
+                else if (v is UnityEngine.Object) L(name + " -> " + Desc(v));
+                else if (v is IEnumerable)
+                {
+                    int count = 0;
+                    foreach (object item in (IEnumerable)v)
+                    {
+                        if (count < 10 && depth < 2) DumpObject(item, name + "[" + count + "]. ", depth + 1);
+                        count++;
+                    }
+                    L(name + " count = " + count);
+                }
+                else if (depth < 2) DumpObject(v, name + ". ", depth + 1);
+            }
+        }
+
+        private void Track(Type crestType, Type hcType)
+        {
+            Type tim = CrestMaker.FindType("ToolItemManager");
+            if (tim != null)
+            {
+                foreach (MethodInfo m in tim.GetMethods(All))
+                {
+                    if (!m.IsStatic || m.GetParameters().Length != 0 || m.ReturnType != crestType) continue;
+                    object r = m.Invoke(null, null);
+                    string name = Desc(r);
+                    if (name != lastCrest)
+                    {
+                        lastCrest = name;
+                        L("current crest via " + m.Name + " = " + name);
+                    }
+                    break;
+                }
+            }
+
+            object hc = UnityEngine.Object.FindObjectOfType(hcType);
+            if (hc == null) return;
+            string cfg = "";
+            string attack = "";
+            foreach (FieldInfo f in hcType.GetFields(All))
+            {
+                if (f.IsStatic) continue;
+                if (f.FieldType.Name == "HeroControllerConfig")
+                    cfg += f.Name + "=" + Desc(f.GetValue(hc)) + " ";
+                else if (f.Name.IndexOf("attack", StringComparison.OrdinalIgnoreCase) >= 0 && f.FieldType.IsPrimitive)
+                    attack += f.Name + "=" + f.GetValue(hc) + " ";
+            }
+            if (cfg != lastCfg) { lastCfg = cfg; L("hero config fields: " + cfg); }
+            if (attack != lastAttack) { lastAttack = attack; L("hero attack fields: " + attack); }
         }
     }
 }
