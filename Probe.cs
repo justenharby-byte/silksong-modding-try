@@ -1,15 +1,15 @@
 using System;
 using System.Collections;
 using System.Reflection;
-using BepInEx;
 using UnityEngine;
 
 namespace HookTest
 {
-    [BepInPlugin("user.crestprobe", "CrestProbe", "1.0.0")]
-    public class CrestProbe : BaseUnityPlugin
+    public class CrestProbe : MonoBehaviour
     {
         private const BindingFlags All = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static;
+
+        private static BepInEx.Logging.ManualLogSource Logger { get { return HookTestPlugin.Log; } }
 
         private void Awake()
         {
@@ -36,7 +36,8 @@ namespace HookTest
             try
             {
                 UnityEngine.Object[] all = Resources.FindObjectsOfTypeAll(crestType);
-                return all.Length > 0 && FindType("HeroController") != null && UnityEngine.Object.FindObjectOfType(FindType("HeroController")) != null;
+                Type hc = FindType("HeroController");
+                return all.Length > 0 && hc != null && UnityEngine.Object.FindObjectOfType(hc) != null;
             }
             catch (Exception) { return false; }
         }
