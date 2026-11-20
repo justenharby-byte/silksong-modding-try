@@ -7,7 +7,7 @@ using UnityEngine;
 
 namespace HookTest
 {
-    [BepInPlugin("user.alphaomegacrest", "AlphaOmegaCrestMaker", "1.0.3")]
+    [BepInPlugin("user.alphaomegacrest", "AlphaOmegaCrestMaker", "1.1.0")]
     public class HookTestPlugin : BaseUnityPlugin
     {
         internal static BepInEx.Logging.ManualLogSource Log;
@@ -15,23 +15,81 @@ namespace HookTest
         private void Awake()
         {
             Log = Logger;
-            Logger.LogInfo("AOCrest v4: Awake");
+            Logger.LogInfo("AOCrest v5: Awake");
+            try { RegisterHooks(); }
+            catch (Exception e) { Logger.LogError("AOCrest: RegisterHooks failed: " + e); }
             try { gameObject.AddComponent<CrestMaker>(); }
             catch (Exception e) { Logger.LogError("AOCrest: AddComponent maker failed: " + e); }
             try { gameObject.AddComponent<CrestDiag>(); }
             catch (Exception e) { Logger.LogError("AOCrest: AddComponent diag failed: " + e); }
         }
+
+        private void RegisterHooks()
+        {
+            Type harmony = null;
+            foreach (Assembly a in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                try { harmony = a.GetType("HarmonyLib.Harmony", false); } catch (Exception) { }
+                if (harmony != null) break;
+            }
+            if (harmony == null) { Logger.LogError("AOCrest: Harmony not found"); return; }
+            object h = Activator.CreateInstance(harmony);
+            MethodInfo pp = harmony.GetMethod("PatchPostfix", CrestMaker.All);
+            if (pp == null) { Logger.LogError("AOCrest: PatchPostfix not found"); return; }
+            AddHook(h, pp, "ToolItemManager", "Awake", "AfterToolItemManagerAwake");
+            AddHook(h, pp, "PlayerData", "SetupNewPlayerData", "AfterPlayerDataSetup");
+            AddHook(h, pp, "PlayerData", "SetupExistingPlayerData", "AfterPlayerDataSetup");
+        }
+
+        private void AddHook(object h, MethodInfo pp, string typeName, string method, string postfixName)
+        {
+            try
+            {
+                Type t = CrestMaker.FindType(typeName);
+                if (t == null) { Logger.LogError("AOCrest: type missing " + typeName); return; }
+                MethodInfo target = null;
+                foreach (MethodInfo m in t.GetMethods(CrestMaker.All | BindingFlags.DeclaredOnly))
+                {
+                    if (m.Name == method) { target = m; break; }
+                }
+                MethodInfo postfix = typeof(Hooks).GetMethod(postfixName, CrestMaker.All);
+                if (target == null || postfix == null) { Logger.LogError("AOCrest: method missing " + typeName + "." + method); return; }
+                pp.Invoke(h, new object[] { target, postfix });
+                Logger.LogInfo("AOCrest: hooked " + typeName + "." + method);
+            }
+            catch (Exception e) { Logger.LogError("AOCrest: hook " + typeName + "." + method + " failed: " + e); }
+        }
+    }
+
+    internal static class Hooks
+    {
+        private static void AfterToolItemManagerAwake() { CrestMaker.TryMake("ToolItemManager.Awake"); }
+        private static void AfterPlayerDataSetup() { CrestMaker.EnsureSave("PlayerData setup"); }
     }
 
     public class CrestMaker : MonoBehaviour
     {
         internal const BindingFlags All = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static;
-        private const string CrestName = "AlphaOmega";
+        internal const string CrestName = "AlphaOmega";
+        private const int SlotCount = 9;
         private static readonly string[] SpeedFields = { "attackDuration", "quickAttackSpeedMult", "attackRecoveryTime", "attackCooldownTime", "quickAttackCooldownTime", "canBind" };
+        internal static bool Made;
+        internal static bool SaveDone;
 
-        private static void Log(string s) { HookTestPlugin.Log.LogInfo("AOCrest: " + s); }
+        internal static void Log(string s) { HookTestPlugin.Log.LogInfo("AOCrest: " + s); }
 
-        private void Awake() { StartCoroutine(Run()); }
+        private void Awake() { StartCoroutine(Fallback()); }
+
+        private IEnumerator Fallback()
+        {
+            for (int i = 0; i < 150; i++)
+            {
+                yield return new WaitForSeconds(2f);
+                if (!Made) TryMake("fallback");
+                if (Made && !SaveDone) EnsureSave("fallback");
+                if (Made && SaveDone) yield break;
+            }
+        }
 
         internal static Type FindType(string name)
         {
@@ -71,40 +129,89 @@ namespace HookTest
             else Log("field not found: " + name);
         }
 
-        private bool Ready(Type crestType, Type hcType)
+        internal static object GetPlayerData()
+        {
+            Type pd = FindType("PlayerData");
+            if (pd == null) return null;
+            foreach (FieldInfo f in pd.GetFields(All))
+                if (f.IsStatic && f.FieldType == pd) { object v = f.GetValue(null); if (v != null) return v; }
+            foreach (PropertyInfo p in pd.GetProperties(All))
+            {
+                if (p.PropertyType != pd || p.GetIndexParameters().Length != 0) continue;
+                MethodInfo g = p.GetGetMethod(true);
+                if (g != null && g.IsStatic) { object v = g.Invoke(null, null); if (v != null) return v; }
+            }
+            return null;
+        }
+
+        internal static void EnsureSave(string why)
         {
             try
             {
-                return Resources.FindObjectsOfTypeAll(crestType).Length >= 5
-                    && UnityEngine.Object.FindObjectOfType(hcType) != null;
+                object pd = GetPlayerData();
+                if (pd == null) return;
+                object te = GetF(pd, "ToolEquips");
+                if (te == null) return;
+                Type tt = te.GetType();
+                MethodInfo set = tt.GetMethod("SetData", All);
+                if (set == null) { Log("SetData missing"); return; }
+
+                bool has = false;
+                MethodInfo names = tt.GetMethod("GetValidNames", All);
+                if (names != null)
+                {
+                    IList l = names.Invoke(te, null) as IList;
+                    if (l != null) foreach (object o in l) if ((string)o == CrestName) has = true;
+                }
+                if (has)
+                {
+                    MethodInfo get = tt.GetMethod("GetData", All);
+                    if (get == null || get.GetParameters().Length != 1) { SaveDone = true; Log("save entry kept (" + why + ")"); return; }
+                    object cur = get.Invoke(te, new object[] { CrestName });
+                    IList slots = cur == null ? null : GetF(cur, "Slots") as IList;
+                    if (slots != null && (slots.Count == 0 || slots.Count == SlotCount)) { SaveDone = true; Log("save ok, slots=" + slots.Count + " (" + why + ")"); return; }
+                    Log("save slots mismatch (" + (slots == null ? -1 : slots.Count) + ") -> reset");
+                }
+
+                Type dt = set.GetParameters()[1].ParameterType;
+                object data = Activator.CreateInstance(dt);
+                SetF(data, "IsUnlocked", true);
+                SetF(data, "DisplayNewIndicator", true);
+                FieldInfo sf = FindField(dt, "Slots");
+                if (sf != null)
+                {
+                    if (sf.FieldType.IsArray) sf.SetValue(data, Array.CreateInstance(sf.FieldType.GetElementType(), 0));
+                    else sf.SetValue(data, Activator.CreateInstance(sf.FieldType));
+                }
+                set.Invoke(te, new object[] { CrestName, data });
+                SaveDone = true;
+                Log("save data created (" + why + ")");
             }
-            catch (Exception) { return false; }
+            catch (Exception e) { Log("EnsureSave failed: " + e.Message); }
         }
 
-        private IEnumerator Run()
+        internal static void TryMake(string why)
         {
-            Type crestType = FindType("ToolCrest");
-            Type hcType = FindType("HeroController");
-            if (crestType == null || hcType == null) { Log("types missing"); yield break; }
-            for (int i = 0; i < 300; i++)
+            if (Made) return;
+            try
             {
-                yield return new WaitForSeconds(2f);
-                if (Ready(crestType, hcType)) break;
+                Type crestType = FindType("ToolCrest");
+                if (crestType == null) return;
+                Made = Build(crestType, why);
             }
-            try { Build(crestType); }
             catch (Exception e) { HookTestPlugin.Log.LogError("AOCrest: build failed: " + e); }
         }
 
-        private void Build(Type crestType)
+        private static bool Build(Type crestType, string why)
         {
             UnityEngine.Object witch = null, wanderer = null;
             foreach (UnityEngine.Object c in Resources.FindObjectsOfTypeAll(crestType))
             {
-                if (c.name == CrestName) { Log("crest already exists"); return; }
+                if (c.name == CrestName) { Log("crest already exists"); return true; }
                 if (c.name == "Witch") witch = c;
                 if (c.name == "Wanderer") wanderer = c;
             }
-            if (witch == null || wanderer == null) { Log("Witch or Wanderer not found"); return; }
+            if (witch == null || wanderer == null) return false;
 
             UnityEngine.Object clone = UnityEngine.Object.Instantiate(witch);
             clone.name = CrestName;
@@ -120,12 +227,12 @@ namespace HookTest
             foreach (string fn in SpeedFields)
             {
                 FieldInfo f = FindField(newCfg.GetType(), fn);
-                if (f == null) { Log("config field missing: " + fn); continue; }
+                if (f == null) continue;
                 f.SetValue(newCfg, f.GetValue(wandCfg));
             }
             SetF(clone, "heroConfig", newCfg);
 
-            int slotCount = BuildSlots(clone, witch, wanderer);
+            if (BuildSlots(clone, witch, wanderer) == 0) return false;
 
             try
             {
@@ -136,67 +243,8 @@ namespace HookTest
             catch (Exception e) { Log("name change failed: " + e.Message); }
 
             Register(clone);
-
-            try
-            {
-                MethodInfo unlock = crestType.GetMethod("Unlock", All);
-                if (unlock != null && unlock.GetParameters().Length == 0)
-                {
-                    unlock.Invoke(clone, null);
-                    Log("Unlock called");
-                }
-            }
-            catch (Exception e) { Log("Unlock failed: " + e.Message); }
-
-            try { SyncSave(clone, slotCount); }
-            catch (Exception e) { Log("SyncSave failed: " + e); }
-
-            Log("DONE - crest " + CrestName + " created");
-        }
-
-        private static void SyncSave(UnityEngine.Object crest, int n)
-        {
-            PropertyInfo p = crest.GetType().GetProperty("SaveData", All);
-            if (p == null) { Log("SaveData property missing"); return; }
-            object sd = p.GetValue(crest, null);
-            if (sd == null) { Log("SaveData is null"); return; }
-            FieldInfo sf = FindField(sd.GetType(), "Slots");
-            if (sf == null) { Log("SaveData.Slots missing"); return; }
-            object cur = sf.GetValue(sd);
-            IList curList = cur as IList;
-            if (curList == null) { Log("SaveData.Slots is not a list"); return; }
-            int before = curList.Count;
-            if (before == n) { Log("SaveData slots already " + n); return; }
-
-            Type elem = cur is Array ? cur.GetType().GetElementType() : cur.GetType().GetGenericArguments()[0];
-            List<object> items = new List<object>();
-            for (int i = 0; i < n; i++)
-            {
-                object it = i < before ? curList[i] : Activator.CreateInstance(elem);
-                if (i >= before)
-                {
-                    FieldInfo iu = FindField(elem, "IsUnlocked");
-                    if (iu != null) iu.SetValue(it, true);
-                }
-                items.Add(it);
-            }
-
-            object fresh;
-            if (cur is Array)
-            {
-                Array arr = Array.CreateInstance(elem, n);
-                for (int i = 0; i < n; i++) arr.SetValue(items[i], i);
-                fresh = arr;
-            }
-            else
-            {
-                IList lst = (IList)Activator.CreateInstance(cur.GetType());
-                foreach (object it in items) lst.Add(it);
-                fresh = lst;
-            }
-            sf.SetValue(sd, fresh);
-            p.SetValue(crest, sd, null);
-            Log("SaveData slots fixed: " + before + " -> " + n);
+            Log("DONE - crest created via " + why);
+            return true;
         }
 
         private static object Pick(List<object> protos, string type, string bind)
@@ -211,7 +259,7 @@ namespace HookTest
             return typeOnly;
         }
 
-        private int BuildSlots(UnityEngine.Object clone, UnityEngine.Object witch, UnityEngine.Object wanderer)
+        private static int BuildSlots(UnityEngine.Object clone, UnityEngine.Object witch, UnityEngine.Object wanderer)
         {
             Array wSlots = (Array)GetF(witch, "slots");
             Array pSlots = (Array)GetF(wanderer, "slots");
@@ -267,16 +315,14 @@ namespace HookTest
                 ns.SetValue(s, i);
             }
             SetF(clone, "slots", ns);
-            Log("slots built: " + n);
             return n;
         }
 
-        private void Register(UnityEngine.Object clone)
+        private static void Register(UnityEngine.Object clone)
         {
             Type listType = FindType("ToolCrestList");
             if (listType == null) { Log("ToolCrestList type not found"); return; }
-            UnityEngine.Object[] lists = Resources.FindObjectsOfTypeAll(listType);
-            foreach (UnityEngine.Object list in lists)
+            foreach (UnityEngine.Object list in Resources.FindObjectsOfTypeAll(listType))
             {
                 bool added = false;
                 Type t = list.GetType();
@@ -300,7 +346,7 @@ namespace HookTest
                         }
                         else il.Add(clone);
                         added = true;
-                        Log("added to " + f.Name);
+                        Log("added to crest list field " + f.Name);
                         break;
                     }
                     t = t.BaseType;
@@ -319,13 +365,6 @@ namespace HookTest
 
         private void Awake() { StartCoroutine(Run()); }
 
-        private static UnityEngine.Object FindByName(Type t, string name)
-        {
-            foreach (UnityEngine.Object o in Resources.FindObjectsOfTypeAll(t))
-                if (o.name == name) return o;
-            return null;
-        }
-
         private static string Desc(object v)
         {
             if (v == null) return "null";
@@ -338,47 +377,30 @@ namespace HookTest
 
         private static string CurrentCrestId()
         {
-            Type pd = CrestMaker.FindType("PlayerData");
-            if (pd == null) return "PlayerData type missing";
-            object inst = null;
-            foreach (FieldInfo f in pd.GetFields(All))
-                if (f.IsStatic && f.FieldType == pd) { inst = f.GetValue(null); break; }
-            if (inst == null)
-                foreach (PropertyInfo p in pd.GetProperties(All))
-                {
-                    if (p.PropertyType != pd || p.GetIndexParameters().Length != 0) continue;
-                    MethodInfo g = p.GetGetMethod(true);
-                    if (g != null && g.IsStatic) { inst = g.Invoke(null, null); break; }
-                }
-            if (inst == null) return "PlayerData instance not found";
-            FieldInfo cf = CrestMaker.FindField(pd, "CurrentCrestID");
-            return cf == null ? "CurrentCrestID missing" : Desc(cf.GetValue(inst));
+            object pd = CrestMaker.GetPlayerData();
+            if (pd == null) return "no PlayerData";
+            FieldInfo cf = CrestMaker.FindField(pd.GetType(), "CurrentCrestID");
+            return cf == null ? "CurrentCrestID missing" : Desc(cf.GetValue(pd));
         }
 
         private IEnumerator Run()
         {
-            Type crestType = CrestMaker.FindType("ToolCrest");
             Type hcType = CrestMaker.FindType("HeroController");
-            if (crestType == null || hcType == null) { L("types missing"); yield break; }
+            if (hcType == null) { L("HeroController missing"); yield break; }
 
-            UnityEngine.Object ours = null;
             for (int i = 0; i < 300; i++)
             {
                 yield return new WaitForSeconds(3f);
-                try
-                {
-                    ours = FindByName(crestType, "AlphaOmega");
-                    if (ours != null && UnityEngine.Object.FindObjectOfType(hcType) == null) ours = null;
-                }
-                catch (Exception) { ours = null; }
-                if (ours != null) break;
+                bool ready = false;
+                try { ready = UnityEngine.Object.FindObjectOfType(hcType) != null && CrestMaker.Made; }
+                catch (Exception) { }
+                if (ready) break;
             }
-            if (ours == null) { L("our crest or hero never found"); yield break; }
 
-            try { LogSave(crestType, ours); }
-            catch (Exception e) { L("save log failed: " + e.Message); }
+            try { L("slots info: " + SlotInfo()); }
+            catch (Exception e) { L("slot info failed: " + e.Message); }
 
-            yield return new WaitForSeconds(20f);
+            yield return new WaitForSeconds(25f);
             try { AutoEquip(); }
             catch (Exception e) { L("auto equip failed: " + e); }
 
@@ -390,13 +412,19 @@ namespace HookTest
             }
         }
 
-        private void LogSave(Type crestType, UnityEngine.Object ours)
+        private static string SlotInfo()
         {
-            Array slots = (Array)CrestMaker.GetF(ours, "slots");
-            PropertyInfo p = crestType.GetProperty("SaveData", All);
-            object sd = p == null ? null : p.GetValue(ours, null);
-            IList sl = sd == null ? null : CrestMaker.GetF(sd, "Slots") as IList;
-            L("crest slots=" + slots.Length + " saveSlots=" + (sl == null ? -1 : sl.Count));
+            Type crestType = CrestMaker.FindType("ToolCrest");
+            foreach (UnityEngine.Object c in Resources.FindObjectsOfTypeAll(crestType))
+            {
+                if (c.name != CrestMaker.CrestName) continue;
+                Array slots = (Array)CrestMaker.GetF(c, "slots");
+                PropertyInfo p = crestType.GetProperty("SaveData", All);
+                object sd = p == null ? null : p.GetValue(c, null);
+                IList sl = sd == null ? null : CrestMaker.GetF(sd, "Slots") as IList;
+                return "crest slots=" + slots.Length + " saveSlots=" + (sl == null ? -1 : sl.Count);
+            }
+            return "crest not found";
         }
 
         private void AutoEquip()
@@ -412,8 +440,7 @@ namespace HookTest
                 if (target == null) { L("no ToolItemManager instance"); return; }
             }
             L("before equip: " + CurrentCrestId());
-            m.Invoke(target, new object[] { "AlphaOmega" });
-            L("SetEquippedCrest called");
+            m.Invoke(target, new object[] { CrestMaker.CrestName });
             L("after equip: " + CurrentCrestId());
         }
 
